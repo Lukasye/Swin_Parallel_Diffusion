@@ -1,0 +1,46 @@
+defaults:
+  - _self_
+  - model: small
+
+ngpu: 2
+work_dir: null
+
+group:
+  type: Swin
+  num_diffuser: 1
+  scaling_factor: 2
+  kernel_size: 32
+  shift: 4
+
+training:
+  dataset: CELEBA_64
+  batch_size: 42
+  accumulation_iters: 8
+  sample_count: 1
+  num_workers: 0
+  num_epochs: 1000000
+  save_every: 8000
+  record_loss_every: 80
+  learning_rate: 3e-4
+  noise_steps: 100
+  beta_start: 0.007
+  beta_end: 0.02
+  warm_up: 200
+  res_scale: 2.0
+
+evaluation:
+  batch_size: 32
+  num_samples: 5000
+  fid: False
+  ref: ./static/cifar10-32x32.npz
+
+data:
+  dataset_path: /bigpool/homes/yeyun/projects/PyramidDiffusionModel/datasets
+  imresize_method: 'bilinear'
+
+hydra:
+  run:
+    dir: exp_local/${training.dataset}/${now:%Y.%m.%d}/
+  sweep:
+    dir: exp/${training.dataset}/${now:%Y.%m.%d}/
+    subdir: ${hydra.job.num}

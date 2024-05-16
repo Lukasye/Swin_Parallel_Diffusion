@@ -1,0 +1,5 @@
+name: small
+use_rrdb: True
+num_layer: 3
+layer_decay: 1
+num_rrdb_blocks: 2
