@@ -1,4 +1,4 @@
 type: Swin
-kernel_size: 64
+kernel_size: 32
 shift: 8
 rolling_pattern: still
