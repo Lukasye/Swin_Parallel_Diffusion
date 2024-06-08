@@ -9,6 +9,7 @@ class RRDBNet(nn.Module):
                  num_feature: int,
                  output_channel: int, 
                  num_of_blocks: int,
+                 scaling_factor: int,
                  gc=32):
         super(RRDBNet, self).__init__()
         RRDB_block_f = functools.partial(RRDB, nf=num_feature, gc=gc)
@@ -17,10 +18,17 @@ class RRDBNet(nn.Module):
         self.RRDB_trunk = make_layer(RRDB_block_f, num_of_blocks)
         self.trunk_conv = nn.Conv2d(num_feature, num_feature, 3, 1, 1, bias=True)
 
+        num_down = int(scaling_factor ** 0.5)
         self.upconv1 = nn.Conv2d(num_feature, num_feature, 3, 1, 1, bias=True)
-        self.conv_last = nn.Conv2d(num_feature, output_channel, 3, 1, 1, bias=True)
 
-        self.HRconv = nn.Conv2d(num_feature, num_feature, 3, 1, 1, bias=True)
+        # self.output_down = nn.Sequential(*[nn.LeakyReLU(negative_slope=0.2),
+        #                                    nn.Conv2d(num_feature, num_feature, 3, 1, 1, bias=True), 
+        #                                    nn.MaxPool2d(kernel_size=(2, 2))] * num_down)
+        self.output_down = nn.Sequential(*[nn.LeakyReLU(negative_slope=0.2),
+                                           nn.Conv2d(num_feature, num_feature, 3, 1, 1, bias=True)] * num_down)
+
+        self.conv_last = nn.Conv2d(num_feature, output_channel, 3, 1, 1, bias=True)
+        # self.HRconv = nn.Conv2d(num_feature, num_feature, 3, 1, 1, bias=True)
         self.lrelu = nn.LeakyReLU(negative_slope=0.2)
 
     def forward(self, x):
@@ -34,11 +42,13 @@ class RRDBNet(nn.Module):
         fea = fea_first + trunk
         feas.append(fea)
 
-        # TODO: make it adaptive to scaling factor
         # fea = self.lrelu(self.upconv1(F.interpolate(fea, scale_factor=2, mode='nearest')))
-        fea_hr = self.HRconv(fea)
-        out = self.conv_last(self.lrelu(fea_hr))
-        out = out.clamp(-1, 1)
+        # fea_hr = self.HRconv(fea)
+        # out = self.conv_last(self.lrelu(fea_hr))
+        fea = self.output_down(fea)
+        out = self.conv_last(self.lrelu(fea))
+        out = out.clamp(0, 1)
+        out = out * 2 - 1
 
         return out, torch.cat(feas, dim=1)
 

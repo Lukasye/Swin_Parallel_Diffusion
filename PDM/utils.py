@@ -35,11 +35,19 @@ def save_checkpoint(
         optimizer: optim.Optimizer = None,
         scheduler: optim.lr_scheduler = None,
         grad_scaler: GradScaler = None,
+        ddp: bool = False
 ) -> None:
-    checkpoint = {
-        'state_dict': model.state_dict(),
-        'ema_state_dict': ema_model.state_dict()
-    }
+    if ddp:
+        checkpoint = {
+            'state_dict': model.module.state_dict(),
+            # 'ema_state_dict': ema_model.module.state_dict()
+            'ema_state_dict': ema_model.state_dict()
+        }
+    else:
+        checkpoint = {
+            'state_dict': model.state_dict(),
+            'ema_state_dict': ema_model.state_dict()
+        }
     if optimizer:
         checkpoint['optimizer'] = optimizer.state_dict()
     if scheduler:
@@ -97,3 +105,4 @@ def setup(rank, world_size, port):
     dist.init_process_group(
         "nccl", rank=rank, world_size=world_size, timeout=datetime.timedelta(minutes=30)
     )
+

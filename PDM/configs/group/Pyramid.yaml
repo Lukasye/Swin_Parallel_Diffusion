@@ -1,0 +1,4 @@
+type: Pyramid
+num_diffuser: 2
+kernel_size: 32
+shift: 4

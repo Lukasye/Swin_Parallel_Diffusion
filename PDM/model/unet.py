@@ -173,7 +173,7 @@ class TransformerEncoderSA(nn.Module):
         attention_value, _ = self.mha(query=x_ln, key=x_ln, value=x_ln)
         attention_value = attention_value + x
         attention_value = self.ff_self(attention_value) + attention_value
-        return attention_value.permute(0, 2, 1).view(-1, self.num_channels, self.size, self.size)
+        return attention_value.permute(0, 2, 1).view(-1, self.num_channels, self.size, self.size).contiguous()
 
 class ConditionEmbedding(nn.Module):
     def __init__(self, input_dim:int, output_dim:int, emd_dim:int = 32) -> None:
@@ -190,32 +190,41 @@ class ConditionEmbedding(nn.Module):
 class UNet(nn.Module):
     def __init__(
             self,
+            cfg,
             image_size,
             num_channels,
-            condition_ch: int = 7,
-            num_rrdb_blocks: int = 3,
-            num_layer: int = 3,
-            noise_steps: int = 1000,
             time_dim: int = 256,
-            rrdb: bool = False
     ):
         super(UNet, self).__init__()
         self.time_dim = time_dim
-        self.rrdb = rrdb
-        self.pos_encoding = PositionalEncoding(embedding_dim=time_dim, max_len=noise_steps)
+        self.pos_encoding = PositionalEncoding(embedding_dim=time_dim, max_len=cfg.training.noise_steps)
 
-        if rrdb:
-            self.condition_conv = RRDBNet(input_channel=condition_ch,
-                                          num_feature=16, 
-                                          output_channel=3,
-                                          num_of_blocks=num_rrdb_blocks)
+        # RRDB
+        num_down = int(cfg.training.scaling_factor ** 0.5)
+        assert num_down > 0
+        # self.condition_conv = RRDBNet(input_channel=condition_ch,
+        #                                 num_feature=16, 
+        #                                 output_channel=3,
+        #                                 num_of_blocks=num_rrdb_blocks, 
+        #                                 scaling_factor=scaling_factor)
 
-            self.condition_proj = nn.Sequential(nn.MaxPool2d(kernel_size=(2, 2)),
-                                                nn.Conv2d(16 * ((num_rrdb_blocks + 1)), 64, 
-                                                          kernel_size=(3, 3), padding=(1, 1)),)
-                                                # nn.MaxPool2d(kernel_size=(2, 2)))
+        if cfg.group.type == 'Swin':
+            self.extract_condition = RRDBNet(input_channel=cfg.rrdb.cond_channel,
+                                            num_feature=cfg.rrdb.num_feature, 
+                                            output_channel=num_channels,
+                                            num_of_blocks=cfg.model.num_rrdb_blocks, 
+                                            scaling_factor=cfg.training.scaling_factor)
+            cond_proj1 = [nn.Conv2d(cfg.rrdb.num_feature * ((cfg.model.num_rrdb_blocks + 1)), 64, kernel_size=(3, 3), padding=(1, 1))]
+            # ele_proj = [nn.GELU(), nn.MaxPool2d(kernel_size=(2, 2)), nn.Conv2d(64, 64, kernel_size=(3, 3), padding=(1, 1))]
+            ele_proj = [nn.GELU(), nn.Conv2d(64, 64, kernel_size=(3, 3), padding=(1, 1))]
+            self.condition_proj = nn.Sequential(*(cond_proj1 + ele_proj * (num_down)))
+            self.rrdb = True
         else:
-            self.condition_conv = ConditionEmbedding(input_dim=4, output_dim=64)
+            self.extract_condition = nn.Sequential(*([nn.Conv2d(3, 32, kernel_size=(3, 3), padding=(1, 1)), nn.GELU(), 
+                                                    nn.Conv2d(32, 64, kernel_size=(3, 3), padding=(1, 1))]))
+            self.condition_proj = nn.GELU()
+            self.rrdb = False
+
 
         self.input_conv = DoubleConv(num_channels, 64)
         self.down1 = Down(64, 128)
@@ -254,22 +263,17 @@ class UNet(nn.Module):
         # else:
         #     x_in = x
 
+        x = self.input_conv(x)
 
-        # for swin diffusion
-        # if condition is not None:
-        #     x_in = x + self.condition(condition)
-        # else:
-        #     x_in = x
-
-        x1 = self.input_conv(x)
-
-        # this is for initial convolutional condition
-        # x1 = x1 + self.condition_conv(condition, t)
-        # x1 = x1 + self.condition_conv(condition)
-
-        out, cond = self.condition_conv(condition)
-        cond = self.condition_proj(cond)
-        x1 = x1 + cond
+        if condition is not None:
+            if self.rrdb:
+                _, condition = self.extract_condition(condition)
+            else:
+                condition = self.extract_condition(condition)
+            condition = self.condition_proj(condition)
+            x1 = x + condition
+        else:
+            x1 = x
 
         x2 = self.down1(x1, t)
         x2 = self.sa1(x2)
@@ -289,4 +293,4 @@ class UNet(nn.Module):
         x = self.up3(x, x1, t)
         x = self.sa6(x)
 
-        return self.out_conv(x), out
+        return self.out_conv(x)

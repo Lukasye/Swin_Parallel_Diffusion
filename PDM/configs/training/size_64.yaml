@@ -1,0 +1,15 @@
+dataset: CELEBA_64
+batch_size: 20
+accumulation_iters: 4
+sample_count: 1
+num_workers: 0
+num_epochs: 1000000
+save_every: 8000
+record_loss_every: 100
+learning_rate: 3e-4
+noise_steps: 100
+beta_start: 0.007
+beta_end: 0.02
+warm_up: 200
+res_scale: 2.0
+scaling_factor: 2

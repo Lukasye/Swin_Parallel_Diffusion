@@ -1,52 +1,56 @@
-import matplotlib.pyplot as plt
-
+import pickle
 import os
+import random
 import torch
 import torchvision
 from torchvision import transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torch import distributed as dist
+import torch.nn.functional as F
 from abc import abstractmethod, ABC
+from pytorch_wavelets import DWTForward, DWTInverse
 # from ignite.metrics import FID
 
-from data_utils import celeba_dataloader
+from data_utils import SRDataloader
 from ddpm import Trainer
 from downsampler import LaplacianDownsampler
 import utils
+from metrics.sr_metrics import Measure
 
 
 
-class TrainerGroup:
+class TrainerGroup(ABC):
     def __init__(self,
                  cfg,
                  rank,
                  init_test,
                  customer_dataloader = None,
+                 train: bool = True,
+                 memroy_check: bool = True
                  ) -> None:
         self.init_test = init_test
         self.rank = rank
         self.world_size = cfg.ngpu
         self.device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu") if rank > -1 else torch.device("cpu")
+        self.train_mod = train
+        self.memory_check = memroy_check and self.rank == 0
 
         self.batch_size = cfg.training.batch_size // self.world_size
-        self.eval_batch_size = cfg.evaluation.batch_size // self.world_size
+        self.eval_batch_size = cfg.evaluation.batch_size
         self.num_epochs = cfg.training.num_epochs
         self.dataset = cfg.training.dataset
         self.save_every = cfg.training.save_every
         self.record_loss_every = cfg.training.record_loss_every
         self.iteration_counter =  0
-        self.num_diffuser = cfg.group.num_diffuser
-        self.scaling_factor = cfg.group.scaling_factor
+        self.img_downsample_factor = cfg.training.scaling_factor
         self.noise_steps = cfg.training.noise_steps
         self.epoch = 0
         self.current_loss = 0.
 
         self.paths, self.logger = self.prepare_working_env(cfg.work_dir)
-        self.dataloader, self.image_size, self.num_channels = self.prepare_dataset(cfg, batch_size=self.batch_size,
-                                                                                   external_dataloader=customer_dataloader)
-        self.sample_dataloader, _, _ = self.prepare_dataset(cfg, batch_size=self.eval_batch_size,
-                                                            external_dataloader=customer_dataloader)
+        (self.dataloader, self.sample_dataloader), self.image_size, self.num_channels = self.prepare_dataset(cfg, batch_size=self.batch_size,
+                                                                                   val_batch_size=self.eval_batch_size, external_dataloader=customer_dataloader)
 
     def prepare_working_env(self, work_dir: str):
         paths = {}
@@ -59,8 +63,10 @@ class TrainerGroup:
 
     def prepare_dataset(self, cfg: str, 
                         batch_size: int,
+                        val_batch_size: int,
                         external_dataloader: DataLoader = None) -> DataLoader:
         assert cfg.training.batch_size % cfg.ngpu == 0
+        # generator = torch.Generator().manual_seed(2024)
         dataset_name = cfg.training.dataset
         if external_dataloader is not None and  dataset_name == 'CUSTOM':
             return external_dataloader, next(iter(external_dataloader)).shape[-1], 3
@@ -72,15 +78,12 @@ class TrainerGroup:
                                                              transform=data_transforms,
                                                              train=True,
                                                              download=True)
-            return DataLoader(
-                diffusion_dataset,
-                batch_size=batch_size,
-                shuffle=True,
-                pin_memory=True,
-                num_workers=cfg.training.num_workers,
-                drop_last=False,
-                collate_fn=utils.collate_fn,
-            ), 32, 3
+            train, val = random_split(diffusion_dataset, lengths=[0.9, 0.1])
+            train_loader = DataLoader(train,batch_size=batch_size,shuffle=True,
+                                      pin_memory=True,num_workers=cfg.training.num_workers,drop_last=False,collate_fn=utils.collate_fn)
+            val_loader = DataLoader(val,batch_size=batch_size,shuffle=True,
+                                      pin_memory=True,num_workers=cfg.training.num_workers,drop_last=False,collate_fn=utils.collate_fn)
+            return train_loader, val_loader, 32, 3
         elif dataset_name == 'IMAGENET':
             size = 64
             data_transforms = transforms.Compose([
@@ -89,19 +92,18 @@ class TrainerGroup:
                 transforms.Lambda(lambda t: (t * 2) - 1)])
             diffusion_dataset = torchvision.datasets.ImageNet(cfg.data.dataset_path,
                                                               transform=data_transforms)
-            return DataLoader(
-                diffusion_dataset,
-                batch_size=batch_size,
-                shuffle=True,
-                pin_memory=True,
-                num_workers=cfg.training.num_workers,
-                drop_last=False,
-                collate_fn=utils.collate_fn,
-            ), size, 3
+            train, val = random_split(diffusion_dataset, lengths=[0.9, 0.1])
+            train_loader = DataLoader(train,batch_size=batch_size,shuffle=True,
+                                      pin_memory=True,num_workers=cfg.training.num_workers,drop_last=False,collate_fn=utils.collate_fn)
+            val_loader = DataLoader(val,batch_size=batch_size,shuffle=True,
+                                      pin_memory=True,num_workers=cfg.training.num_workers,drop_last=False,collate_fn=utils.collate_fn)
+            return (train_loader, val_loader), size, 3
         elif dataset_name.startswith('CELEBA'):
             size = int(dataset_name.split('_')[1])
-            return celeba_dataloader.get_celeba_dataloader(os.path.join(cfg.data.dataset_path, 'celeba', f'resize_{size}'),
-                                         batch_size=batch_size, scale=self.scaling_factor), size, 3
+            return SRDataloader.get_celeba_dataloader(os.path.join(cfg.data.dataset_path, 'celeba', f'resize_{size}'),
+                                         batch_size=batch_size, val_batch_size=val_batch_size, 
+                                         scale=self.img_downsample_factor, 
+                                         augmentation=cfg.data.augmentation), size, 3
         else:
             raise NotImplementedError(f'No such kind of Dataset {dataset_name}')
 
@@ -131,7 +133,7 @@ class TrainerGroup:
         pass
 
     @ abstractmethod
-    def train_one_step(self, batch: torch.Tensor):
+    def train_one_step(self, batch: tuple) -> float:
         """ one training step
 
         Args:
@@ -140,15 +142,23 @@ class TrainerGroup:
         pass
 
     @ abstractmethod
-    def sample(self, save: bool=True) -> list:
+    def sample(self, save: bool=True):
         """sample a batch of images with the current NN
 
         Args:
             save (bool, optional): Whether the outcome is saved asa jpg images.
 
         Returns:
-            list : list of samples generated
+            generate sample with shape (bs, c, w, h)
         """
+        pass
+
+    @abstractmethod
+    def evaluate(self, pred: torch.Tensor, target: torch.Tensor):
+        pass
+
+    @abstractmethod
+    def print_basic_info(self):
         pass
 
 ################################################# HELPER FUNCTION #########################################
@@ -190,8 +200,13 @@ class Pyramid_TrainerGroup(TrainerGroup):
     """
     Class to coordinate different diffusor.
     """
-    def __init__(self, cfg, rank, init_test = True) -> None:
-        super().__init__(cfg, rank, init_test)
+    def __init__(self, cfg, 
+                 rank, 
+                 init_test = True,
+                 train: bool = True,
+                 ) -> None:
+        super().__init__(cfg, rank, init_test, train=train)
+        self.num_diffuser = cfg.group.num_diffuser
         self.trainers = [Trainer(cfg, int(self.image_size/(i+1)), num_channels=self.num_channels, device=self.device) 
                          for i in range(self.num_diffuser)]
         self.downsampler = LaplacianDownsampler(self.num_diffuser, device=self.device)
@@ -292,7 +307,7 @@ class Pyramid_TrainerGroup(TrainerGroup):
             list : list of samples generated in different scale
         """
 
-        self.log_print(f"Generating sample at iterationstep: {self.iteration_counter}")
+        self.log_print(f"Generating sample at epoch {self.epoch} iteration step: {self.iteration_counter}")
         sample = self.trainers[-1].sample(sample_count=self.eval_batch_size)
         result = [sample.clone()]
 
@@ -314,13 +329,13 @@ class Pyramid_TrainerGroup(TrainerGroup):
 
 ################################################# EVALUATION FUNCTION #########################################
 
-    def evaluate(self, fids):
+    def evaluate(self, pred, target=None):
         fid = []
 
         with torch.no_grad():
             results = self.sample()
 
-        for result, gaussian in zip(results[::-1], fids):
+        for result, gaussian in zip(results[::-1], pred):
             fid.append(self.get_fid_score(result, gaussian))
         
         return fid
@@ -338,40 +353,53 @@ class Pyramid_TrainerGroup(TrainerGroup):
 
 
 class Swin_TrainerGroup(TrainerGroup):
-    def __init__(self, cfg, rank, init_test = True) -> None:
-        super().__init__(cfg, rank, init_test)
-        assert self.image_size % self.scaling_factor == 0
+    def __init__(self, cfg, rank, 
+                 init_test = True,
+                 train: bool = True,
+                 rrdb_mode: bool = False
+                 ) -> None:
+        super().__init__(cfg, rank, init_test, train=train)
 
         self.diffuser_kernel_size = cfg.group.kernel_size
-        self.crop_size = self.diffuser_kernel_size * self.scaling_factor
-        # self.shift = self.image_size - self.crop_size
+        self.scaling_factor = self.image_size // self.diffuser_kernel_size
+        assert self.image_size % self.scaling_factor == 0
+
+        # self.crop_size = self.diffuser_kernel_size * self.scaling_factor
+        # self.diffuser_kernel_size = self.image_size // self.scaling_factor
+        self.crop_size = self.image_size
+
         self.shift = cfg.group.shift
+        self.rolling_pattern = cfg.group.rolling_pattern
         self.repeats = self.scaling_factor ** 2
         self.pattern = [(0, 0), (0, self.shift), (self.shift, self.shift), (self.shift, 0)]
+        self.avg_pool = torch.nn.AvgPool2d(kernel_size=self.scaling_factor, stride=self.scaling_factor)
 
-        # self.ordinary_diffuser = Trainer(cfg, self.image_size / self.scaling_factor, num_channels=self.num_channels, device=self.device)
-        self.swin_diffuser = Trainer(cfg, rank, self.diffuser_kernel_size, num_channels=self.num_channels, device=self.device)
-        self.downsampler = LaplacianDownsampler(self.num_diffuser, factor=self.scaling_factor, device=self.device)
-        
+        self.swin_diffuser = Trainer(cfg, rank, self.diffuser_kernel_size, num_channels=self.num_channels, device=self.device, train=self.train_mod)
         self.attention_mask = self.generate_attention_mask().to(self.device)
+        self.metric = Measure(self.img_downsample_factor)
 
-        # load checkpoint
-        if len(os.listdir(self.paths['checkpoint_meta'])) != 0:
-            self.load_checkpoints(os.path.join(self.paths['checkpoint_meta'], "checkpoint_meta.pth"))
+        # load checkpoint if there's one and not in rrdb training mode
+        if len(os.listdir(self.paths['checkpoint_meta'])) != 0 and not rrdb_mode:
+            if os.path.exists(os.path.join(self.paths['checkpoint_meta'], "checkpoint_meta.pth")):
+                self.load_checkpoints(os.path.join(self.paths['checkpoint_meta'], "checkpoint_meta.pth"))
+            # if os.path.exists(os.path.join(self.paths['checkpoint_meta'], "rrdb.pth")):
+            #     self.swin_diffuser.load_rrdb(os.path.join(self.paths['checkpoint_meta'], "rrdb.pth"))
         else:
             self.log_print('No checkpoint found, starting from scratch.')
 
         if self.init_test:
             import structure_test
             structure_test.swin_forward_test(self)
-            structure_test.pachify_test(self)
-            structure_test.gaussian_kernel_test(self)
-            structure_test.pyramid_test(self)
+            # structure_test.pachify_test(self)
+            # structure_test.gaussian_kernel_test(self)
+            structure_test.rolling_test(self)
 
         
-    def save_checkpoints(self):
+    def print_basic_info(self):
+        self.print_device_info()
+
+    def save_checkpoints(self, save_rrdb: bool=False):
         checkpoints = {}
-        # checkpoints['ordinary'] = self.ordinary_diffuser.snapshot()
         checkpoints['swin'] = self.swin_diffuser.snapshot()
         checkpoints['Iteration'] = self.iteration_counter
         checkpoints['epoch'] = self.epoch
@@ -382,7 +410,8 @@ class Swin_TrainerGroup(TrainerGroup):
 
 
     def load_checkpoints(self, filename: str):
-        checkpoints = torch.load(filename, map_location="cuda")
+        # checkpoints = torch.load(filename, map_location="cuda")
+        checkpoints = torch.load(filename, map_location=self.swin_diffuser.device)
         self.iteration_counter = checkpoints['Iteration']
         self.epoch = checkpoints['epoch']
         # self.ordinary_diffuser.load_checkpoint(checkpoints['ordinary'])
@@ -457,7 +486,6 @@ class Swin_TrainerGroup(TrainerGroup):
 
         return imgs
 
-
     def generate_attention_mask(self, normalized: bool=True) -> torch.Tensor:
         """ generate attention mask for a single batches, since the attention mask won't change,
             it will be part of the initialization .
@@ -468,10 +496,10 @@ class Swin_TrainerGroup(TrainerGroup):
         Returns:
             torch.Tensor: attention mask with shape (self.batch_size * self.scaling_factor ** 2, 1, self.crop_size, self.crop_size)
         """
-        attention_mask = torch.empty((self.scaling_factor ** 2, self.crop_size, self.crop_size))
+        attention_mask = torch.empty((self.repeats, self.crop_size, self.crop_size))
         half_kernel_size = self.diffuser_kernel_size // 2
         xx, yy = torch.meshgrid(torch.arange(0, (self.crop_size + half_kernel_size) * 2), torch.arange(0, (self.crop_size + half_kernel_size) * 2), indexing='ij')
-        kernel = torch.exp(-((xx - self.crop_size)**2 + (yy - self.crop_size)**2) / (2 * (half_kernel_size)**2))
+        kernel = torch.exp(-((xx - self.crop_size)**2 + (yy - self.crop_size)**2) / (2 * (half_kernel_size * 1.5)**2))
         
         for i in range(self.scaling_factor):
             for j in range(self.scaling_factor):
@@ -487,11 +515,17 @@ class Swin_TrainerGroup(TrainerGroup):
 
                 attention_mask[i * self.scaling_factor + j] = tmp
         
-        attention_mask = torch.cat(self.batch_size * [attention_mask]).unsqueeze(1)
+        # attention_mask = torch.cat(self.batch_size * [attention_mask]).unsqueeze(1)
+        attention_mask = attention_mask.unsqueeze(1)
         return attention_mask
+
+    def print_basic_info(self):
+        self.print_device_info()
 
 
     def train(self):
+        assert self.swin_diffuser is not None
+
         self.log_print('Starting training procedure...')
         self.print_device_info()
         self.log_print(f'Optimizer: {self.swin_diffuser.optimizer.state_dict}')
@@ -499,20 +533,18 @@ class Swin_TrainerGroup(TrainerGroup):
         total_iter_per_batch = len(self.dataloader)
         self.log_print(f'Length of dataloader: {total_iter_per_batch}')
         sample_iter = iter(self.sample_dataloader)
+        # mem_counter = 50
 
         while True:
             train_iter = iter(self.dataloader)
 
-            # for _, (batch, _) in enumerate(self.dataloader):
             while True:
                 if self.iteration_counter >= total_iter_per_batch:
                     break
                 batch = next(train_iter)
-                # batch = batch.to(self.device)
                 batch = self.all_to_device(batch)
 
-                # loss = self.train_sr(batch)
-                loss = self.train_sr_rolling(batch)
+                loss = self.train_one_step(batch)
                 self.current_loss = loss if loss is not None else self.current_loss
 
                 if self.iteration_counter % self.record_loss_every == 0:
@@ -522,12 +554,13 @@ class Swin_TrainerGroup(TrainerGroup):
                 if (self.iteration_counter) % self.save_every == 0:
                     if self.rank == 0:
                         self.save_checkpoints()
-                    sample_batch = next(sample_iter)
-                    sample_batch = self.all_to_device(sample_batch)
-                    # self.sample_sr(sample_batch)
-                    self.sample_sr_rolling(sample_batch)
-
-                    dist.barrier()
+                    batch = next(sample_iter)
+                    batch = self.all_to_device(batch)
+                    pred = self.sample(batch)
+                    self.evaluate(pred, batch)
+                
+                    if self.world_size > 1:
+                        dist.barrier()
 
                 self.iteration_counter += 1
 
@@ -536,96 +569,30 @@ class Swin_TrainerGroup(TrainerGroup):
             self.epoch += 1
             self.iteration_counter = 0
 
-    def train_sr(self, batch: torch.Tensor):
-        repeats = self.scaling_factor ** 2
-        gaussians, laplacians, _ = self.downsampler.transform(batch)
-        gaussian, laplacian = gaussians[0], laplacians[0]
+# ********************************************************** Other Method  *****************************************
 
-        croped_index = torch.randint(0, 4, size=(1, ))
-        croped_batch = self.crop_image(laplacian, croped_index)
-        croped_cond = self.crop_image(gaussian, croped_index)
+    def generate_rolling_pattern(self, rolling_pattern = 'fix_pattern') -> tuple:
+        if rolling_pattern == 'fix_pattern':
+            roll_index = torch.randint(0, 4, size=(1, ))
+            return self.pattern[roll_index]
+        elif rolling_pattern == 'random':
+            return random.randint(0, self.shift), random.randint(0, self.shift)
+        elif rolling_pattern == 'still':
+            return 0, 0
+        else:
+            raise NotImplementedError(f'This kind of rolling pattern is not implemented! patterm:{rolling_pattern}')
 
-        pathes = self.patchify(croped_batch) 
+    def train_one_step(self, batch: tuple):
+        """ Train a single step with rolling shift, for super vision type problem
 
-        # sample noise
-        t = torch.randint(low=1, high=self.noise_steps, size=(self.batch_size, ), device=self.device)
-        t = t.repeat_interleave(dim=0, repeats=self.scaling_factor ** 2)
+        Args:
+            batch (tuple): _description_
 
-        x_t, noise = self.swin_diffuser.diffusion.q_sample(x=pathes, t=t)
-        global_res = self.unpatchify(x_t, self.batch_size)
-
-        # croped_cond = torch.cat(self.scaling_factor ** 2 * [croped_cond], dim=0)
-        # global_res = torch.cat(self.scaling_factor ** 2 * [global_res], dim=0)
-        croped_cond = torch.repeat_interleave(croped_cond, repeats=repeats, dim=0)
-        global_res = torch.repeat_interleave(global_res, repeats=repeats, dim=0)
-
-        condition = torch.cat((croped_cond, global_res, self.attention_mask), dim=1)
-
-        loss = self.swin_diffuser.train_one_step(x_t, condition=condition, 
-                                                 time_step=t, ext_noise=noise)
-        if loss is not None:
-            dist.all_reduce(loss)
-            loss /= self.world_size
-
-        return loss
-
-
-    def sample_sr(self, batch: torch.Tensor, 
-                  save: bool = True, 
-                  sample_step: int = 50, 
-                  save_path: str = None,
-                  shift = True):
-        self.log_print(f"Generating sample at iterationstep: {self.iteration_counter}")
-        batch_size = self.eval_batch_size
-
-        x = torch.randn((batch_size, 3, self.image_size, self.image_size), device=self.device)
-
-        save_path = self.paths['samples'] if save_path is None else save_path
-        save_path = os.path.join(save_path, f'sample_{self.epoch}_{self.iteration_counter}_GPU{self.rank}')
-        if save and not os.path.exists(save_path):
-            os.mkdir(save_path)
-        batch = batch[:batch_size]
-        utils.save_images(batch, os.path.join(save_path, f'groundtruth.jpg'), unnormalized=True)
-        batch, _, _ = self.downsampler.transform(batch)
-        batch = batch[0]
-        utils.save_images(batch, os.path.join(save_path, f'lowres.jpg'), unnormalized=True)
-
-        attention_mask = self.attention_mask[:batch_size * self.scaling_factor ** 2,:,:,:]
-
-        for i in reversed(range(0, self.noise_steps)):
-            pattern_idx = i % 4 if shift else 0
-            # pattern_idx = i % 4 if torch.randint(0, 4, size=(1, )) else 0
-            croped_img = self.crop_image(x, pattern_index= pattern_idx)
-            croped_gloab = self.crop_image(batch, pattern_index= pattern_idx)
-
-            croped_gloab = torch.repeat_interleave(croped_gloab, repeats=self.repeats, dim=0)
-            # utils.save_images(croped_gloab, os.path.join(save_path, f'du_croped_glob.jpg'), unnormalized=True)
-            patch_croped_img = self.patchify(croped_img)
-            # utils.save_images(patch_croped_img, os.path.join(save_path, f'patches.jpg'), unnormalized=True)
-
-            # croped_img = torch.cat(self.scaling_factor ** 2 * [croped_img], dim=0)
-            croped_img = torch.repeat_interleave(croped_img, repeats=self.repeats, dim=0)
-            # utils.save_images(attention_mask, os.path.join(save_path, f'attention.jpg'), unnormalized=True)
-            condition = torch.cat((croped_gloab, croped_img, attention_mask), dim=1)
-
-            extra_info = self.swin_diffuser.sample_step(patch_croped_img, i, condition)
-            self.refill_image(x, extra_info, pattern_index= pattern_idx, train=False)
-            # croped_img[::] = self.unpatchify(extra_info)
-
-            if i % sample_step == 0 and save:
-                utils.save_images(x, os.path.join(save_path, f'res_{i}.jpg'), unnormalized=True)
-                sam = (x + batch)
-                utils.save_images(sam, os.path.join(save_path, f'sample_{i}.jpg'), unnormalized=True)
-
-# ********************************************************** Another Method  *****************************************
-
-    def train_sr_rolling(self, batch: tuple):
-        gt, _, lr_up = batch
-
-        # _, glob_cond, _ = self.downsampler.transform(gt)
-        # glob_cond = glob_cond[0]
-        x_0 = self.swin_diffuser.img2res(gt.clone(), lr_up)
-        # glob_cond, x_0 = gaussians[0], laplacians[0]
+        Returns:
+            _type_: _description_
+        """
+        gt, lr, lr_up = batch
+        x_0 = self.swin_diffuser.img2res(gt, lr_up)
 
         # q_sample on the original image and then patchify it
         t = torch.randint(low=1, high=self.noise_steps, size=(self.batch_size, ), device=self.device)
@@ -633,147 +600,295 @@ class Swin_TrainerGroup(TrainerGroup):
         t = t.repeat_interleave(dim=0, repeats=self.repeats)
         
         # rolling configuration
-        roll_index = torch.randint(0, 4, size=(1, ))
-        roll_pattern = self.pattern[roll_index]
+        roll_pattern = self.generate_rolling_pattern(self.rolling_pattern)
         inverse_roll_pattern = tuple(-shift for shift in roll_pattern)
 
         rolled_batch = torch.roll(x_t_noise, shifts=roll_pattern, dims=(-2, -1))
-        rolled_noise = torch.roll(noise, shifts=roll_pattern, dims=(-2, -1))
+        noise = torch.roll(noise, shifts=roll_pattern, dims=(-2, -1))
 
         input_batch = self.patchify(rolled_batch)
-        noise = self.patchify(rolled_noise)
+        noise = self.patchify(noise)
 
-        # condition = self.generate_rolling_condition(glob_cond, x_t_noise, attention_shift=inverse_roll_pattern)
-        condition = self.generate_rolling_condition(lr_up, x_t_noise, attention_shift=inverse_roll_pattern)
+        condition = self.generate_rolling_condition(lr, attention_shift=inverse_roll_pattern)
 
-        loss = self.swin_diffuser.train_one_step(input_batch, ground_truth=gt, 
+        loss = self.swin_diffuser.train_one_step(input_batch, 
                                                  condition=condition, 
                                                  time_step=t, ext_noise=noise)
 
-        if loss is not None:
+        if loss is not None and self.world_size > 1:
             dist.all_reduce(loss)
             loss /= self.world_size
 
         return loss
 
-    def generate_rolling_condition(self, glob, res, attention_shift: tuple, train:bool=True):
-        attention_mask = self.attention_mask if train else  self.attention_mask[:self.eval_batch_size * self.scaling_factor ** 2,:,:,:]
-        glob_cond = torch.repeat_interleave(glob, repeats=self.repeats, dim=0)
-        x_t_noise = torch.repeat_interleave(res, repeats=self.repeats, dim=0)
+    @ torch.no_grad()
+    def generate_rolling_condition(self, glob, attention_shift: tuple, train:bool=True):
+        # attention_mask = self.attention_mask if train else  self.attention_mask[:self.eval_batch_size * self.scaling_factor ** 2,:,:,:]
+        # Prepare the attention mask according to the batch size
+        num_repeat = self.batch_size if train else self.eval_batch_size
+        attention_mask = torch.cat(num_repeat * [self.attention_mask])
         rolled_attention = torch.roll(attention_mask, shifts=attention_shift, dims=(-2, -1))
-        return torch.cat((glob_cond, x_t_noise, rolled_attention), dim=1)
+        rolled_attention = self.avg_pool(rolled_attention)  # down scale the attention mask with scaling factor
+
+        glob_cond = torch.repeat_interleave(glob, repeats=self.repeats, dim=0)
+        if self.img_downsample_factor != self.scaling_factor:
+            glob_cond = torch.nn.functional.interpolate(glob_cond, scale_factor=self.img_downsample_factor / self.scaling_factor)
+
+        return torch.cat((glob_cond, rolled_attention), dim=1)
 
 
-    def sample_sr_rolling(self, batch: tuple,
+    def sample(self, batch: tuple,
                   save: bool = True, 
                   sample_step: int = 10, 
                   save_path: str = None,
-                  shift = True):
-        self.log_print(f"Generating sample at iterationstep: {self.iteration_counter}")
-        batch_size = self.eval_batch_size
-
-        x = torch.randn((batch_size, 3, self.image_size, self.image_size), device=self.device)
+                  ):
+        self.log_print(f"Generating sample at epoch {self.epoch} iteration step: {self.iteration_counter}")
 
         save_path = self.paths['samples'] if save_path is None else save_path
         save_path = os.path.join(save_path, f'sample_{self.epoch}_{self.iteration_counter}_GPU{self.rank}')
         if save and not os.path.exists(save_path):
             os.mkdir(save_path)
         
-        hr, _, lr_up = batch
-        utils.save_images(hr, os.path.join(save_path, f'original.jpg'), unnormalized=True)
+        hr, lr, lr_up = batch
+        if save:
+            utils.save_images(hr, os.path.join(save_path, f'original.jpg'), unnormalized=True)
+            utils.save_images(lr_up, os.path.join(save_path, f'lowres.jpg'), unnormalized=True)
 
-        # batch, lap, _ = self.downsampler.transform(hr)
-        # batch = batch[0]
+        batch_size = hr.shape[0]
 
-        # utils.save_images(lap[0], os.path.join(save_path, f'groundtruth.jpg'), unnormalized=True)
-        utils.save_images(lr_up, os.path.join(save_path, f'lowres.jpg'), unnormalized=True)
-
-        # cond_glob = batch.clone()
+        x = torch.randn((batch_size, 3, self.image_size, self.image_size), device=self.device)
 
         for i in reversed(range(0, self.noise_steps)):
-            pattern_idx = i % 4 if shift else 0
-            roll_pattern = self.pattern[pattern_idx]
+            roll_pattern = self.generate_rolling_pattern(self.rolling_pattern)
             inverse_roll_pattern = tuple(-shift for shift in roll_pattern)
 
-            rolled_batch = torch.roll(x, shifts=roll_pattern, dims=(-2, -1))
-            patches = self.patchify(rolled_batch)
+            patches = torch.roll(x, shifts=roll_pattern, dims=(-2, -1))
+            patches = self.patchify(patches)
             
-            condition = self.generate_rolling_condition(lr_up, x, attention_shift=inverse_roll_pattern, train=False)
-
+            # condition = self.generate_rolling_condition(lr_up, x, attention_shift=inverse_roll_pattern, train=False)
+            condition = self.generate_rolling_condition(lr, attention_shift=inverse_roll_pattern, train=False)
             patches = self.swin_diffuser.sample_step(patches, i, condition)
 
             # Undo the rolling
-            rolled_batch = self.unpatchify(patches)
-            x = torch.roll(rolled_batch, shifts=inverse_roll_pattern, dims=(-2, -1))
+            patches = self.unpatchify(patches)
+            x = torch.roll(patches, shifts=inverse_roll_pattern, dims=(-2, -1))
 
             if i % sample_step == 0 and save:
                 utils.save_images(x, os.path.join(save_path, f'res_{i}.jpg'), unnormalized=True)
-                sam = self.swin_diffuser.res2img(x.clone(), lr_up)
+                sam = self.swin_diffuser.res2img(x, lr_up)
                 utils.save_images(sam, os.path.join(save_path, f'sample_{i}.jpg'), unnormalized=True)
+        
+        return self.swin_diffuser.res2img(x, lr_up)
 
 
     def scheduler_update(self):
         for trainer in [self.swin_diffuser]:
             trainer.scheduler.step()
 
-    def train_one_step(self, batch: torch.Tensor):
-        counter = self.num_diffuser
-        loss_record = []
-        gaussians, laplacians, fids = self.downsampler.transform(batch)
+    def evaluate(self, pred: torch.Tensor, target: torch.Tensor):
+        self.metric.measure_batch(pred, target, reset_result=True)
+        self.log_print(self.metric.get_result())
 
-        for gaussian, laplacian in zip(gaussians, laplacians):
-            if counter == 1:
-                # If it's already the last layer then do ordinary diffusion
-                loss = self.ordinary_diffuser.train_one_step(gaussian + laplacian)
-            else:
-                # crop the laplacian into pieces
-                croped_batch = self.crop_image(laplacian, torch.randint(0, 4, size=(self.batch_size, )))
 
-                pathes = self.patchify(croped_batch) 
+class DWT_TrainerGroup(TrainerGroup):
+    def __init__(self, cfg,
+                 rank, 
+                 init_test, 
+                 customer_dataloader=None, 
+                 train: bool = True, 
+                 memroy_check: bool = True) -> None:
+        super().__init__(cfg, rank, init_test, customer_dataloader, train, memroy_check)
+        assert self.image_size % 2 == 0
+        self.res_scale = cfg.group.res_scale
 
-                condition = torch.cat((croped_batch, self.attention_mask), dim=1)
+        self.diffuser_kernel_size = self.image_size // 2
+        self.xfm = DWTForward(J=1, mode='zero', wave='haar').to(self.device)  # TODO: check the J value 
+        self.ifm = DWTInverse(mode='zero', wave='haar').to(self.device)
+        self.trainers = {}
+        self.losses = {}
+        # self.tags = ['LA', 'LV', 'LH', 'LD']
+        self.tags = ['LV', 'LH', 'LD']
+        for tag in self.tags:
+            # beta_start = cfg.group.LL_beta_start if tag == 'LA' else cfg.group.beta_start
+            # beta_end = cfg.group.LL_beta_end if tag == 'LA' else cfg.group.beta_end
+            # self.trainers[tag] = Trainer(cfg, rank, self.diffuser_kernel_size, num_channels=self.num_channels, device=self.device, train=self.train_mod,
+            #                         with_condition=False, beta_start=beta_start, beta_end=beta_end)
+            self.trainers[tag] = Trainer(cfg, rank, self.diffuser_kernel_size, num_channels=self.num_channels, device=self.device, train=self.train_mod)
+            self.losses[tag]  = 0
 
-                loss = self.swin_diffuser.train_one_step(pathes, condition=condition)
-            loss_record.append(loss)
-            counter -= 1
+        self.metric = Measure(2)
 
-        return loss_record, fids
+        if len(os.listdir(self.paths['checkpoint_meta'])) != 0:
+            self.load_checkpoints(os.path.join(self.paths['checkpoint_meta'], "checkpoint_meta.pth"))
+        else:
+            self.log_print('No checkpoint found, starting from scratch.')
 
-    def sample(self, save: bool = True) -> list:
-        self.log_print(f"Generating sample at iterationstep: {self.iteration_counter}")
+        if init_test:
+            import structure_test
+            structure_test.dwt_test(self)
+            structure_test.dwt_forward_test(self)
 
-        # Generate sample with ordinary diffusion
-        X_L = self.ordinary_diffuser.sample(sample_count=self.batch_size)
-        if save:
-            x = ((X_L.clamp(-1, 1) + 1 ) * 127.5).type(torch.uint8)
-            utils.save_images(x, os.path.join(self.paths['samples'], f'Ordinary_{self.iteration_counter}.jpg'))
+    def save_checkpoints(self):
+        checkpoints = {}
+        for tag in self.tags:
+            checkpoints[tag] = self.trainers[tag].snapshot()
+        checkpoints['Iteration'] = self.iteration_counter
+        checkpoints['epoch'] = self.epoch
+        torch.save(checkpoints, os.path.join(self.paths['checkpoints'],
+                                             f"{self.dataset}_{self.epoch}_{self.iteration_counter}.pth"))
+        torch.save(checkpoints, os.path.join(self.paths['checkpoint_meta'],
+                                             f"checkpoint_meta.pth"))
 
-        gloabl_feature = self.downsampler.upsample(X_L)
 
-        x = torch.randn((self.batch_size, 3, self.img_size, self.img_size), device=self.device)
+    def load_checkpoints(self, filename: str):
+        checkpoints = torch.load(filename, map_location="cuda")
+        self.iteration_counter = checkpoints['Iteration']
+        self.epoch = checkpoints['epoch']
+        for tag in self.tags:
+            self.trainers[tag].load_checkpoint(checkpoints[tag])
+        self.log_print(f"Checkpoint loaded from {filename}!")
+        self.log_print(f"Current iterarion: {self.iteration_counter}")
 
-        for i in reversed(range(1, self.noise_steps)):
-            pattern_idx = i % 4
-            croped_img = self.crop_image(x, pattern_index= pattern_idx)
-            croped_gloab = self.crop_image(gloabl_feature, pattern_index= pattern_idx)
-            patch_croped_img = self.patchify(croped_img)
+
+    def train(self):
+        self.log_print('Starting training procedure...')
+        self.print_device_info()
+        self.log_print("***************************** Iteration *********************************")
+        total_iter_per_batch = len(self.dataloader)
+        self.log_print(f'Length of dataloader: {total_iter_per_batch}')
+        sample_iter = iter(self.sample_dataloader)
+
+        while True:
+            train_iter = iter(self.dataloader)
+
+            while True:
+                if self.iteration_counter >= total_iter_per_batch:
+                    break
+                batch, _, _ = next(train_iter)
+
+                self.train_one_step(batch.to(self.device))
+
+                if self.iteration_counter % self.record_loss_every == 0:
+                    lr = self.trainers['LD'].optimizer.param_groups[-1]['lr']
+                    self.log_print(f'Epoch {self.epoch} \tIteration: {self.iteration_counter}\tlr: {lr}\nLoss: {self.losses}')
+
+                if (self.iteration_counter) % self.save_every == 0:
+                    if self.rank == 0:
+                        self.save_checkpoints()
+                    batch = next(sample_iter)
+                    batch = self.all_to_device(batch)
+                    pred = self.sample(batch)
+                    self.evaluate(pred, batch)
+                
+                    if self.world_size > 1:
+                        dist.barrier()
+
+                self.iteration_counter += 1
+
+            self.scheduler_update()
+            self.log_print(f'Episode {self.epoch} end.')
+            self.epoch += 1
+            self.iteration_counter = 0
+
+    
+    def train_one_step(self, batch: tuple) -> float:
+        dwt_result = list(self.apply_dwt(batch))
+        condition = dwt_result[0]
+        dwt_result = dwt_result[1:]
+
+        for target, tag in zip(dwt_result, self.tags):
+            trainer = self.trainers[tag]
+            loss = trainer.train_one_step(target, condition)
+            if loss is not None:
+                self.losses[tag] = loss
+
+        return None
+    
+    def sample(self, batch:torch.Tensor, save: bool = True):
+        self.log_print(f"Generating sample at epoch {self.epoch} iteration step: {self.iteration_counter}")
+        ground_truth, _, _ = batch
+        ground_truth = self.apply_dwt(ground_truth)
+
+        save_path = self.paths['samples']
+        save_path = os.path.join(save_path, f'sample_{self.epoch}_{self.iteration_counter}_GPU{self.rank}')
+        if save and not os.path.exists(save_path):
+            os.mkdir(save_path)
+
+        utils.save_images(self.combine_channel(*ground_truth), os.path.join(save_path, f'ground_truth.jpg'),unnormalized=True)
+        condition = list(ground_truth)[0]
+        results = [condition]
+        for tag in self.tags:
+            result = self.trainers[tag].sample(sample_count=self.eval_batch_size, condition=condition)
+            results.append(result)
             
-            condition = torch.cat((croped_gloab, self.attention_mask), dim=1)
-
-            extra_info = self.swin_diffuser.sample_step(patch_croped_img, i, condition)
-            self.refill_image(x, extra_info, pattern_index= pattern_idx)
-            
-        result = x + gloabl_feature
+        pred = self.apply_idwt(*tuple(results))
         if save:
-            x = ((result.clamp(-1, 1) + 1 ) * 127.5).type(torch.uint8)
-            utils.save_images(x, os.path.join(self.paths['samples'], f'{self.iteration_counter}.jpg'))
-        return result
+            utils.save_images(pred, os.path.join(save_path, f'sample.jpg'),
+                                            unnormalized=True)
+            utils.save_images(self.combine_channel(*tuple(results)), 
+                                os.path.join(save_path, f'dwt_sample.jpg'),
+                                            unnormalized=True)
+        return pred
 
-def get_trainergroup(cfg, rank, init_test) -> TrainerGroup:
+    def sample_v2(self, batch:torch.Tensor, save: bool = True, save_step: int = 20):
+        ground_truth, _, _ = batch
+        ground_truth = self.apply_dwt(ground_truth)
+
+        save_path = './tmp'
+        save_path = os.path.join(save_path, f'sample_{self.epoch}_{self.iteration_counter}_GPU{self.rank}')
+        if save and not os.path.exists(save_path):
+            os.mkdir(save_path)
+
+        utils.save_images(self.combine_channel(*ground_truth), os.path.join(save_path, f'ground_truth.jpg'),unnormalized=True)
+        condition = list(ground_truth)[0]
+        x = {}
+        for tag in self.tags:
+            x[tag] = torch.randn((self.eval_batch_size, 3, self.diffuser_kernel_size, self.diffuser_kernel_size), device=self.device)
+
+        for i in reversed(range(0, self.noise_steps)):
+            results = [condition]
+            for tag in self.tags:
+                x[tag] = self.trainers[tag].sample_step(x[tag], i, condition)
+                results.append(x[tag])
+
+            if i % 20 == 0:
+                utils.save_images(self.combine_channel(*tuple(results)), os.path.join(save_path, f'sample_{i}.jpg'),unnormalized=True)
+
+
+    def evaluate(self, pred: torch.Tensor, target: torch.Tensor):
+        self.metric.measure_batch(pred, target, reset_result=True)
+        self.log_print(self.metric.get_result())
+
+    def print_basic_info(self):
+        self.print_device_info()
+
+    def apply_dwt(self, images):
+        images_LL, hfreq_tuple = self.xfm(images)
+        return images_LL, hfreq_tuple[0][:, :, 0, :, :], hfreq_tuple[0][:, :, 1, :, :], hfreq_tuple[0][:, :, 2, :, :]
+
+    def apply_idwt(self, LA: torch.Tensor, LV: torch.Tensor, 
+                   LH: torch.Tensor, LD: torch.Tensor):
+
+        sr_HFreqs = torch.cat([LV.unsqueeze(2), LH.unsqueeze(2), LD.unsqueeze(2)], 2)
+        sr_images = self.ifm((LA, [sr_HFreqs]))
+        return sr_images
+
+    def combine_channel(self, LA, LV, LH, LD):
+        foo = torch.cat([LA, LV], dim=-1)
+        bar = torch.cat([LH, LD], dim=-1)
+        return torch.cat([foo, bar], dim=-2)
+
+    def scheduler_update(self):
+        for tag in self.tags:
+            self.trainers[tag].scheduler.step()
+
+def get_trainergroup(cfg, rank, init_test, train:bool = True) -> TrainerGroup:
     group_type = cfg.group.type
     if group_type == 'Pyramid':
-        return Pyramid_TrainerGroup(cfg, rank, init_test)
+        return Pyramid_TrainerGroup(cfg, rank, init_test, train=train)
     elif group_type == 'Swin':
-        return Swin_TrainerGroup(cfg, rank, init_test)
+        return Swin_TrainerGroup(cfg, rank, init_test, train=train)
+    elif group_type == 'DWT':
+        return DWT_TrainerGroup(cfg, rank, init_test, train=train)
     else:
         raise NotImplementedError(f'{group_type} is not implemented as group type!')

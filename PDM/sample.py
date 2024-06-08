@@ -1,15 +1,15 @@
 import os
-import torch
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
+import time
 import hydra
 from hydra.core.hydra_config import HydraConfig
-import torchvision
-from tqdm import tqdm
 import numpy as np
 
-from ddpm_group import get_trainergroup, Swin_TrainerGroup
-from utils import get_device
-import fid_npzs
-import dnnlib
+from ddpm_group import Swin_TrainerGroup, DWT_TrainerGroup
+import metrics.fid_npzs as fid_npzs
+from metrics import dnnlib
+from metrics.sr_metrics import Measure
 import utils
 
 
@@ -17,31 +17,56 @@ import utils
 def main(cfg):
     hydra_cfg = HydraConfig.get()
     work_dir = hydra_cfg.run.dir 
-    cfg.work_dir = work_dir
+    cfg.work_dir = os.path.join(os.getcwd(), work_dir)
+    for_swin(cfg)
+    # for_dwt(cfg)
+
+
+def for_dwt(cfg):
+    checkpoint_path = '/bigpool/homes/yeyun/projects/PyramidDiffusionModel/PDM/exp_local/Swin/CELEBA_64/(shifting step 4)/checkpoint_meta/checkpoint_meta.pth'
+    tg = DWT_TrainerGroup(cfg, rank=-1, init_test=False, train=True)
+    tg.load_checkpoints(checkpoint_path)
+    sample = next(iter(tg.sample_dataloader))
+    tg.sample_v2(sample)
+
+
+def for_swin(cfg):
+    checkpoint_path = '/bigpool/homes/yeyun/projects/PyramidDiffusionModel/PDM/exp_local/Swin/CELEBA_64/2024.06.07/checkpoint_meta/checkpoint_meta.pth'
+    tg = Swin_TrainerGroup(cfg, rank=0, init_test=False, train=True)
+    tg.load_checkpoints(checkpoint_path)
     num_samples = cfg.evaluation.num_samples
     fid = cfg.evaluation.fid
-
-    tg = Swin_TrainerGroup(cfg, rank=0)
+    sr = cfg.evaluation.sr
+    # tg.load_checkpoints(checkpoint_path)
+    
     save_path = tg.paths['fid']
+    measure = Measure(cfg.training.scaling_factor)
 
-    num_iter = num_samples // cfg.training.batch_size + 1
+    num_iter = 20
     print(f'Generating samples...')
 
-    # for num in tqdm(range(num_iter)):
-        # result = tg.sample(save=False)
-        # result = result[-1]
-        # result = ((result.clamp(-1, 1) + 1 ) * 127.5).type(torch.uint8)
-    for data, _ in tg.dataloader:
-        data = data.to(tg.device)
-        gaussian, _, _ = tg.downsampler.transform(data)
-        result = tg.sample_sr(gaussian[0], shift=False)
-        break
+    counter = 0
+    for batch in tg.sample_dataloader:
+        batch = tg.all_to_device(batch)
+        start = time.time()
+        result = tg.sample(batch, save=False)
+        end = time.time()
+        duration = end - start
+        print(f'Duration: {duration}')
+        utils.save_images(result, save_path=os.path.join(save_path, f'sample_{counter}.jpg'), unnormalized=True)
 
-        # if fid:
-        #     torch.save(result, os.path.join(save_path, f'samples_{num}.pth'))
-        # else:
-        #     utils.save_images(result, os.path.join(save_path, f'{num}.jpg'))
+        if sr:
+            print('Analyzing SR Metrics...')
+            # for b in range(result.shape[0]):
+            #     measure.measure(result[b], batch[0][b], batch[1][b], tg.scaling_factor)
+            measure.measure_batch(result, batch)
+            print(measure.get_result())
 
+        if counter > num_iter:
+            break
+        counter += 1
+
+    print(measure.get_result())
 
     if fid:
         ref_path = cfg.evaluation.ref

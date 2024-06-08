@@ -1,7 +1,6 @@
 import copy
 import os
 from typing import Tuple
-import numpy as np
 
 import torch
 import torch.nn as nn
@@ -12,8 +11,9 @@ from torch.utils.data import Dataset
 from torchvision.transforms import transforms
 from torch import optim
 from torch.functional import F
-from torch import distributed as dist
+# from torch import distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+# from torch.profiler import profile, ProfilerActivity, record_function
 
 import utils
 from model.unet import UNet
@@ -125,7 +125,6 @@ class Diffusion:
 
         eps_model.train()
 
-
         return x
 
     def p_sample_single_step(self, x: torch.Tensor, eps_model: nn.Module, timestep: int, condition: torch.Tensor=None) -> torch.Tensor:
@@ -140,7 +139,7 @@ class Diffusion:
 
             random_noise = torch.randn_like(x) if timestep > 1 else torch.zeros_like(x)
 
-            noise_pred, _ = eps_model(x, t, condition)
+            noise_pred = eps_model(x, t, condition)
             result = ((1 / sqrt_alpha_t) * (x - ((beta_t / sqrt_one_minus_alpha_hat_t) * noise_pred))) +\
                 (epsilon_t * random_noise)
             
@@ -279,7 +278,11 @@ class Trainer:
             num_channels: int,
             device,
             fp16: bool = True,
+            train: bool = True,
+            beta_start: float = None,
+            beta_end: float = None
     ):
+        self.train_mod = train
         self.world_size = cfg.ngpu
         self.num_channels = num_channels
         self.noise_steps = cfg.training.noise_steps
@@ -297,33 +300,39 @@ class Trainer:
         self.sample_count = cfg.training.sample_count
         self.warm_up = cfg.training.warm_up
 
-        self.unet_model = UNet(image_size=image_size, num_channels=num_channels,
-                               rrdb=cfg.model.use_rrdb,
-                               num_rrdb_blocks=cfg.model.num_rrdb_blocks,
-                               num_layer=cfg.model.num_layer).to(device)
-        if self.device.type != 'cpu':
-            self.unet_model = DDP(self.unet_model, device_ids=[rank], static_graph=True)
+        self.unet_model = UNet(cfg, image_size=image_size, num_channels=num_channels).to(device)
+
+        self.ema = EMA(beta=0.95)
+        self.ema_model = copy.deepcopy(self.unet_model).eval().requires_grad_(False)
+
+        self.ddp = False
+        if self.device.type != 'cpu' and self.world_size > 1:
+            if train:
+                self.unet_model = DDP(self.unet_model, device_ids=[rank], static_graph=True)
+                self.ddp = True
+            else:
+                # If the mode is sample, use dataparallel to accelerate the inference
+                self.ema_model = nn.DataParallel(self.ema_model, device_ids=list(range(self.world_size)))
+
+        beta_end = beta_end if beta_end is not None else cfg.training.beta_end
+        beta_start = beta_start if beta_start is not None else cfg.training.beta_start
         self.diffusion = Diffusion(img_size=image_size, 
                                    device=self.device, 
                                    noise_steps=cfg.training.noise_steps,
-                                   beta_end=cfg.training.beta_end, 
-                                   beta_start=cfg.training.beta_start)
+                                   beta_end=beta_end, 
+                                   beta_start=beta_start)
         self.optimizer = optim.Adam(
             params=self.unet_model.parameters(), lr=self.learning_rate,  # betas=(0.9, 0.999)
         )
 
         # Training scheduler
-        num_warmup = cfg.training.warm_up
-        warmup = lambda current_step: current_step / num_warmup
+        warmup = lambda current_step: current_step / self.warm_up
 
         self.warmup_scheduler = optim.lr_scheduler.LambdaLR(optimizer=self.optimizer, lr_lambda=warmup)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=self.optimizer, T_max=200)
 
         # self.loss_fn = nn.MSELoss().to(self.device)
         self.grad_scaler = GradScaler()
-
-        self.ema = EMA(beta=0.95)
-        self.ema_model = copy.deepcopy(self.unet_model).eval().requires_grad_(False)
 
         self.start_epoch = 0
 
@@ -342,10 +351,9 @@ class Trainer:
     def sample_step(self,
                     input_tensor: torch.Tensor,
                     timestep: int,
-                    condition: torch.Tensor):
-        # return self.diffusion.p_sample_single_step(input_tensor, eps_model=self.ema_model, timestep=timestep, condition=condition)
+                    condition: torch.Tensor,
+                    ):
         return self.diffusion.p_sample_single_step(input_tensor, eps_model=self.ema_model, timestep=timestep, condition=condition)
-
 
     def sample_gif(
             self,
@@ -368,8 +376,11 @@ class Trainer:
             output_name=f'{output_name}_ema',
         )
 
+    def save_rrdb(self, save_path):
+        checkpoint = {'state_dict': self.rrdb.state_dict()}
+        torch.save(checkpoint, save_path)
+
     def train_one_step(self, real_images:torch.Tensor, 
-                       ground_truth: torch.Tensor,
                        condition:torch.Tensor=None,
                        time_step: torch.Tensor=None,
                        ext_noise: torch.tensor=None,):
@@ -382,6 +393,7 @@ class Trainer:
         Returns:
             float: loss
         """
+        assert self.train_mod
         real_images = real_images.to(self.device)
         if time_step is None:
             current_batch_size = real_images.shape[0]
@@ -394,11 +406,12 @@ class Trainer:
             x_t = real_images
             noise = ext_noise
 
+
         with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.fp16):
 
-            predicted_noise, rrdb_out = self.unet_model(x=x_t, t=time_step, condition=condition)
+            predicted_noise = self.unet_model(x=x_t, t=time_step, condition=condition)
 
-            loss = F.smooth_l1_loss(predicted_noise, noise) + F.smooth_l1_loss(rrdb_out, rrdb_out)
+            loss = F.smooth_l1_loss(predicted_noise, noise)
 
             self.accumulated_minibatch_loss += loss.detach()
 
@@ -411,7 +424,11 @@ class Trainer:
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
-            self.ema.ema_step(ema_model=self.ema_model, model=self.unet_model)
+
+            if self.ddp:
+                self.ema.ema_step(ema_model=self.ema_model, model=self.unet_model.module)
+            else:
+                self.ema.ema_step(ema_model=self.ema_model, model=self.unet_model)
 
             return_loss = self.accumulated_minibatch_loss
             self.accumulated_minibatch_loss = 0.0
@@ -431,24 +448,35 @@ class Trainer:
         Returns:
             dict: a checkpoint dictionary for this scale
         """
+        print('Saving checkpoint')
         return utils.save_checkpoint(
             model=self.unet_model,
             ema_model=self.ema_model,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             grad_scaler=self.grad_scaler,
+            ddp=self.ddp 
         )
     
 
     def load_checkpoint(self, checkpoint) -> int:
-        self.unet_model.load_state_dict(checkpoint['state_dict'], strict=False)
-        self.ema_model.load_state_dict(checkpoint['ema_state_dict'], strict=False)
+        if self.ddp:
+            self.unet_model.module.load_state_dict(checkpoint['state_dict'], strict=False)
+            # self.ema_model.module.load_state_dict(checkpoint['ema_state_dict'], strict=False)
+            self.ema_model.load_state_dict(checkpoint['ema_state_dict'], strict=False)
+        else:
+            self.unet_model.load_state_dict(checkpoint['state_dict'], strict=False)
+            self.ema_model.load_state_dict(checkpoint['ema_state_dict'], strict=False)
         if 'optimizer' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer'])
         if 'scheduler' in checkpoint:
             self.scheduler.load_state_dict(checkpoint['scheduler'])
         if 'grad_scaler' in checkpoint:
             self.grad_scaler.load_state_dict(checkpoint['grad_scaler'])
+
+    def load_rrdb(self, path):
+        checkpoint = torch.load(path, map_location="cuda")
+        self.rrdb.load_state_dict(checkpoint['state_dict'], strict=False)
 
 
     def forward_test(self, batch, step_size: int = 50):
@@ -489,12 +517,13 @@ class Trainer:
 
     def res2img(self, img_, img_lr_up, clip_input: bool=True):
         if clip_input:
-            img_ = img_.clamp(-1, 1)
-        img_ = img_ / self.res_scale + img_lr_up
-        return img_
+            img = img_.clamp(-1, 1)
+        img = img / self.res_scale + img_lr_up
+        return img
 
     def img2res(self, x, img_lr_up, clip_input:bool=True):
         x = (x - img_lr_up) * self.res_scale
         if clip_input:
             x = x.clamp(-1, 1)
         return x
+

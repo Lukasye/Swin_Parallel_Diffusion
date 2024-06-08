@@ -1,3 +1,6 @@
+import os
+# os.environ["CUDA_VISIBLE_DEVICES"]="1"
+
 import hydra
 from hydra.core.hydra_config import HydraConfig
 import numpy as np
@@ -18,7 +21,7 @@ def main(cfg):
         mp.set_start_method("forkserver")
         mp.spawn(run_process, args=(cfg.ngpu, cfg, port), nprocs=cfg.ngpu, join=True)
     except Exception as e:
-        print(e, exc_info=True)
+        print(e)
 
 
 def run_process(rank, world_size, cfg, port):

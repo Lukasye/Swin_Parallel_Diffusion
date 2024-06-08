@@ -5,10 +5,10 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 
-from ddpm_group import get_trainergroup, Swin_TrainerGroup, TrainerGroup
+from ddpm_group import get_trainergroup, Swin_TrainerGroup, DWT_TrainerGroup
 from utils import get_device
 from model.rrdb import RRDBNet
-from data_utils import celeba_dataloader
+from data_utils import SRDataloader
 import utils
 
 
@@ -34,7 +34,7 @@ def pyramid_test(tg: Swin_TrainerGroup):
 
 
 def swin_forward_test(tg: Swin_TrainerGroup, step_size: int = 10,
-                      num_sampless: int = 2):
+                      num_sampless: int = 1):
     print('Running swin forward diffusion test...')
     data, _, lr_up = next(iter(tg.dataloader))
     data = data.to(tg.device)
@@ -114,8 +114,8 @@ def gaussian_kernel_test(tg: Swin_TrainerGroup):
     bached_result = results
     # bached_result = torch.cat(3*[results])
     print(results.shape)
-    fig, axes = plt.subplots(num * 2, num , figsize=(15, 30))
-    for i in range(num * 2):
+    fig, axes = plt.subplots(num, num, figsize=(15, 15))
+    for i in range(num):
         for j in range(num):
             ax = axes[i, j]
             result = bached_result[i * num + j]
@@ -161,6 +161,43 @@ def swin_test(tg: Swin_TrainerGroup):
     batch, _, _ = next(iter(tg.dataloader))
     tg.sample_sr(batch, save_path='./')
 
+def dwt_test(tg: DWT_TrainerGroup):
+    batch, _, _ = next(iter(tg.dataloader))
+    LA, LV, LH, LD = tg.apply_dwt(batch.to(tg.device))
+    foobar = tg.combine_channel(LA, LV, LH, LD)
+    utils.save_images(foobar,
+                      os.path.join(tg.paths['test'], 'dwt_test.jpg'), 
+                      unnormalized=True)
+    idwt = tg.apply_idwt(LA, LV, LH, LD)
+    utils.save_images(idwt,
+                      os.path.join(tg.paths['test'], 'idwt_test.jpg'), 
+                      unnormalized=True)
+
+
+def dwt_forward_test(tg: DWT_TrainerGroup, step_size: int = 10,
+                      num_sampless: int = 2):
+    print('Running dwt forward diffusion test...')
+    data, lr, _ = next(iter(tg.dataloader))
+    data = data.to(tg.device)
+    lr = lr.to(tg.device)
+    for j in range(num_sampless):
+
+        results = []
+        # sample = tg.combine_channel(*tg.apply_dwt(data[j, ::].unsqueeze(0)))
+        samples = list(tg.apply_dwt(data[j, ::].unsqueeze(0)))
+        condition = samples[0]
+        samples = samples[1:]
+
+        for i in range(0, tg.noise_steps , step_size):
+            x_t_s = [condition]
+            t = torch.ones(size=(1, )) * i
+            t = t.long()
+            for tag, sample in zip(tg.tags, samples):
+                x_t, _ = tg.trainers[tag].diffusion.q_sample(sample, t)
+                x_t_s.append(x_t)
+
+            results.append(tg.combine_channel(*tuple(x_t_s)))
+        utils.save_images(images=torch.concat(results), unnormalized=True, save_path=os.path.join(tg.paths['test'], f'forward_sample_{j}.jpg'))
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
