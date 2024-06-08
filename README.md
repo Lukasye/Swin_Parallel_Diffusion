@@ -5,7 +5,7 @@ Links for powerpoint: [Online Power Point](https://docs.google.com/presentation/
 ## Introduction
 The project aims to accelerate diffusion model inference for image synthesis and super-resolution tasks by dividing the original image into patches and processing them with independent diffusion kernels. 
 We propose a series of methods to mitigate the artifacts introduced by this patch-based approach and test the results on datasets such as CIFAR and CelebA using traditional super-resolution tasks.
-![image](./img/overview.png)
+![image](./img/overview.PNG)
 ## Installation
 The requirment file is provided, to install the environment use the command:
 ```
